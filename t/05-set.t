@@ -5,7 +5,7 @@ use Cwd qw(cwd);
 
 #repeat_each(2);
 
-plan tests => repeat_each() * (blocks() * 3);
+plan tests => repeat_each() * (blocks() * 3) + 1;
 
 my $pwd = cwd();
 
@@ -19,7 +19,7 @@ run_tests();
 
 __DATA__
 
-=== TEST 1: delete() errors if no ipc module
+=== TEST 1: set() errors if no ipc
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -35,7 +35,7 @@ __DATA__
 --- request
 GET /t
 --- response_body
-no ipc to propagate update, specify ipc_shm
+no ipc to propagate update, specify opts.ipc_shm or opts.ipc
 --- no_error_log
 [error]
 
@@ -266,7 +266,81 @@ value from get(): nil
 
 
 
-=== TEST 7: set() invalidates other workers' LRU cache
+=== TEST 7: set() respects 'set_shm_tries'
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local dict = ngx.shared.cache_shm
+            dict:flush_all()
+            dict:flush_expired()
+            local mlcache = require "resty.mlcache"
+
+            -- fill up shm
+
+            local idx = 0
+
+            while true do
+                local ok, err, forcible = dict:set(idx, string.rep("a", 2^2))
+                if not ok then
+                    ngx.log(ngx.ERR, err)
+                    return
+                end
+
+                if forcible then
+                    break
+                end
+
+                idx = idx + 1
+            end
+
+            -- shm:set() will evict up to 30 items when the shm is full
+            -- now, trigger a hit with a larger value which should trigger LRU
+            -- eviction and force the slab allocator to free pages
+
+            local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
+                ipc_shm = "ipc_shm",
+            }))
+
+            local data, err = cache:set("key", {
+                shm_set_tries = 5,
+            }, string.rep("a", 2^12))
+            if err then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            -- from shm
+
+            cache.lru:delete("key")
+
+            local cb_called
+            local function cb()
+                cb_called = true
+            end
+
+            local data, err = cache:get("key", nil, cb)
+            if err then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            ngx.say("type of data in shm: ", type(data))
+            ngx.say("callback was called: ", cb_called ~= nil)
+        }
+    }
+--- request
+GET /t
+--- response_body
+type of data in shm: string
+callback was called: false
+--- no_error_log
+[warn]
+[error]
+
+
+
+=== TEST 8: set() calls broadcast() with invalidated key
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -274,22 +348,26 @@ value from get(): nil
             local mlcache = require "resty.mlcache"
 
             local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
-                ipc_shm = "ipc_shm",
-                debug   = true, -- allows same worker to receive its own published events
+                ipc = {
+                    register_listeners = function() end,
+                    broadcast = function(channel, data, ...)
+                        ngx.say("channel: ", channel)
+                        ngx.say("data: ", data)
+                        ngx.say("other args:", ...)
+                        return true
+                    end,
+                    poll = function() end,
+                }
             }))
 
-            cache.ipc:subscribe("mlcache:invalidations:" .. cache.name, function(data)
-                ngx.say("received event from invalidations: ", data)
-            end)
-
             assert(cache:set("my_key", nil, nil))
-
-            assert(cache:update())
         }
     }
 --- request
 GET /t
 --- response_body
-received event from invalidations: my_key
+channel: mlcache:invalidations:my_mlcache
+data: my_key
+other args:
 --- no_error_log
 [error]

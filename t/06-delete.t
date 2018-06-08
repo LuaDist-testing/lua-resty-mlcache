@@ -21,7 +21,7 @@ run_tests();
 
 __DATA__
 
-=== TEST 1: delete() errors if no ipc module
+=== TEST 1: delete() errors if no ipc
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -37,7 +37,7 @@ __DATA__
 --- request
 GET /t
 --- response_body
-no ipc to propagate deletion, specify ipc_shm
+no ipc to propagate deletion, specify opts.ipc_shm or opts.ipc
 --- no_error_log
 [error]
 
@@ -75,7 +75,7 @@ key must be a string
             local mlcache = require "resty.mlcache"
 
             local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
-                ipc_shm = "ipc_shm"
+                ipc_shm = "ipc_shm",
             }))
 
             local value = 123
@@ -136,7 +136,7 @@ from callback: 456
 
 
 
-=== TEST 4: delete() invalidates other workers' LRU cache
+=== TEST 4: delete() calls broadcast with invalidated key
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -144,22 +144,26 @@ from callback: 456
             local mlcache = require "resty.mlcache"
 
             local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
-                ipc_shm = "ipc_shm",
-                debug   = true, -- allows same worker to receive its own published events
+                ipc = {
+                    register_listeners = function() end,
+                    broadcast = function(channel, data, ...)
+                        ngx.say("channel: ", channel)
+                        ngx.say("data: ", data)
+                        ngx.say("other args:", ...)
+                        return true
+                    end,
+                    poll = function() end,
+                }
             }))
 
-            cache.ipc:subscribe("mlcache:invalidations:" .. cache.name, function(data)
-                ngx.say("received event from invalidations: ", data)
-            end)
-
             assert(cache:delete("my_key"))
-
-            assert(cache:update())
         }
     }
 --- request
 GET /t
 --- response_body
-received event from invalidations: my_key
+channel: mlcache:invalidations:my_mlcache
+data: my_key
+other args:
 --- no_error_log
 [error]

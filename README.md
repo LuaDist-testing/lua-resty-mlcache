@@ -73,7 +73,9 @@ The cache level hierarchy is:
     - [peek](#peek)
     - [set](#set)
     - [delete](#delete)
+    - [purge](#purge)
     - [update](#update)
+- [Changelog](#changelog)
 - [License](#license)
 
 # Synopsis
@@ -143,8 +145,17 @@ http {
     * lua-resty-lock
 
 This library **should** be entirely compatible with older versions of
-OpenResty, but it has only been tested against OpenResty `1.11.2.2` and
-greater.
+OpenResty.
+
+| OpenResty   | Compatibility
+|------------:|:--------------------|
+| <           | not tested
+| `1.11.2.2`  | :heavy_check_mark:
+| `1.11.2.3`  | :heavy_check_mark:
+| `1.11.2.4`  | :heavy_check_mark:
+| `1.11.2.5`  | :heavy_check_mark:
+| `1.13.6.1`  | :heavy_check_mark:
+| >           | not tested
 
 [Back to TOC](#table-of-contents)
 
@@ -184,7 +195,7 @@ describing the error.
 
 The first argument `name` is an arbitrary name of your choosing for this cache,
 and must be a string. Each mlcache instance namespaces the values it holds
-according to its name, so several instances with the same name would
+according to its name, so several instances with the same name will
 share the same data.
 
 The second argument `shm` is the name of the `lua_shared_dict` shared memory
@@ -208,16 +219,42 @@ holding the desired options for this instance. The possible options are:
   cached misses will never expire.
   **Default:** `5`.
 - `lru`: a lua-resty-lrucache instance of your choice. If specified, mlcache
-  will not instanciate an LRU. One can use this value to use the
+  will not instantiate an LRU. One can use this value to use the
   `resty.lrucache.pureffi` implementation of lua-resty-lrucache if desired.
-- `resty_lock_opts`: options for [lua-resty-lock] instances. When mlcache
-  runs the L3 callback, it uses lua-resty-lock to ensure that a single
-  worker runs the provided callback.
-- `ipc_shm`: if you wish to use [set()](#set) or [delete()](#delete), you
-  must specify a second `lua_shared_dict` shared memory zone. This shm will
-  be used as a pub/sub backend for invalidation events propagation across
-  workers. Several mlcache instances can use the same `ipc_shm` (events will
-  be namespaced).
+- `shm_set_tries`: the number of tries for the lua_shared_dict `set()`
+  operation. When the lua_shared_dict is full, it attempts to free up to 30
+  items from its queue. When the value being set is much larger than the freed
+  space, this option allows mlcache to retry the operation (and free more slots)
+  until the maximum number of tries is reached or enough memory was freed for
+  the value to fit.
+  **Default**: `3`.
+- `shm_miss`: _optional_ string. The name of a `lua_shared_dict`. When
+  specified, misses (callbacks returning `nil`) will be cached in this separate
+  lua_shared_dict. This is useful to ensure that a large number of cache misses
+  (e.g. triggered by clients) does not evict too many cache items (hits) from
+  the lua_shared_dict specified by `shm`. Particularly useful depending on the
+  type of workload put on mlcache.
+- `resty_lock_opts`: options for [lua-resty-lock] instances. When mlcache runs
+  the L3 callback, it uses lua-resty-lock to ensure that a single worker runs
+  the provided callback.
+- `l1_serializer`: an _optional_ function. Its signature and accepted values
+  are documented under the [get()](#get) method, along with an example.  If
+  specified, this function will be called by each worker every time the L1 LRU
+  cache is a miss and the value needs to be fetched from a lower cache level
+  (L2/L3).  Its purpose is to perform arbitrary serialization of the cached
+  item to transform it into any Lua object _before_ storing it into the L1 LRU
+  cache.  It can thus avoid your application from having to repeat such
+  transformation upon every cache hit, such as creating tables, cdata objects,
+  functions, etc...
+- `ipc_shm`: _optional_ string. If you wish to use [set()](#set),
+  [delete()](#delete), or [purge()](#purge), you must provide an IPC
+  (Inter-process communication) mechanism for workers to invalidate their L1
+  LRU caches. This module bundles an "off the shelf" IPC library, and you can
+  enable it by specifying a dedicated `lua_shared_dict` in this option. Several
+  mlcache instances can use the same shared dict (events will be namespaced),
+  but no other actor than mlcache should tamper with it.
+- `ipc`: an _optional_ table . Like the above `ipc_shm` option, but lets you use
+  the IPC library of your choice to send inter-worker events.
 
 Example:
 
@@ -246,9 +283,22 @@ local cache_2 = mlcache.new("cache_2", "cache_shared_dict", { lru_size = 1e5 })
 
 In the above example, `cache_1` is ideal for holding a few, very large values.
 `cache_2` can be used to hold a large number of small values. Both instances
-will rely on the same shm: `lua_shared_dict mlcache_shm 2048m;`. Even if
+will rely on the same shm: `lua_shared_dict cache_shared_dict 2048m;`. Even if
 you use identical keys in both caches, they will not conflict with each other
 since they each bear a different name.
+
+This other example instanciates an mlcache using the bundled IPC module for
+inter-workers invalidation events (so we can use [set()](#set),
+[delete()](#delete), and [purge()](#purge)):
+
+```lua
+local mlcache = require "resty.mlcache"
+
+local cache, err = mlcache.new("my_cache_with_ipc", "cache_shared_dict", {
+    lru_size = 1000,
+    ipc_shm = "ipc_shared_dict"
+})
+```
 
 [Back to TOC](#table-of-contents)
 
@@ -287,6 +337,24 @@ options:
   accepts fractional number parts, like `0.3`. A `neg_ttl` of `0` means the
   cached misses will never expire.
   **Default:** inherited from the instance.
+- `shm_set_tries`: the number of tries for the lua_shared_dict `set()`
+  operation. When the lua_shared_dict is full, it attempts to free up to 30
+  items from its queue. When the value being set is much larger than the freed
+  space, this option allows mlcache to retry the operation (and free more slots)
+  until the maximum number of tries is reached or enough memory was freed for
+  the value to fit.
+  **Default:** inherited from the instance.
+- `l1_serializer`: an _optional_ function. Its signature and accepted values
+  are documented in the example below.
+  If specified, this function will be called by each worker every time the L1
+  LRU cache is a miss and the value needs to be fetched from a lower cache
+  level (L2/L3).
+  Its purpose is to perform arbitrary serialization of the cached item to
+  transform it into any Lua object _before_ storing it into the L1 LRU cache.
+  It can thus avoid your application from having to repeat such transformation
+  upon every cache hit, such as creating tables, cdata objects, functions,
+  etc...
+  **Default:** inherited from the instance.
 
 The third argument `callback` **must** be a function. Its signature and return
 values are documented in the following example:
@@ -301,15 +369,15 @@ local function callback(arg1, arg2, arg3)
     -- ...
 
     -- value: the value to cache (Lua scalar or table)
-    -- nil: ignored for now - will be used in later versions of this module
+    -- err: if not `nil`, will abort get(), which will return `value` and `err`
     -- ttl: ttl for this value - will override `ttl` or `neg_ttl` if specified
     return value, nil, ttl
 end
 ```
 
 This function **can** throw Lua errors as it runs in protected mode. Such
-errors thrown from the callback will be logged by this module for debug
-purposes.
+errors thrown from the callback will be returned as strings in the second
+return value `err`.
 
 When called, `get()` follows the below steps:
 
@@ -320,14 +388,17 @@ When called, `get()` follows the below steps:
 2. query the L2 cache (`lua_shared_dict` shared memory zone). This cache is
    shared by all workers, and is less efficient than the L1 cache. It also
    involves serialization for Lua tables.
-    1. if the L2 cache has the value, it sets the value in the L1 cache,
-       and returns it.
+    1. if the L2 cache has the value, retrieve it.
+        1. if `l1_serializer` is set, run it, and set the resulting value in
+           the L1 cache.
+        2. if not, directly set the value as-is in the L1 cache.
     2. if the L2 cache does not have the value (L2 miss), it continues.
-3. creates a [lua-resty-lock], and ensures that a single worker will run
-   the callback (other workers trying to access the same value will wait).
+3. creates a [lua-resty-lock], and ensures that a single worker will run the
+   callback (other workers trying to access the same value will wait).
 4. a single worker runs the L3 callback.
 5. the callback returns (ex: it performed a database query), and the worker
-   sets the value in the L2 and L1 caches, and returns it.
+   sets the value in the L2 cache. It then sets it in its L1 cache as well
+   (as-is by default, or as returned by `l1_serializer` if specified).
 6. other workers that were trying to access the same value but were waiting
    fetch the value from the L2 cache (they do not run the L3 callback) and
    return it.
@@ -347,14 +418,15 @@ end
 local function fetch_user(db, user_id)
     local user, err = db:query_user(user_id)
     if err then
-        error(err) -- safe to throw: will be logged
+        -- in this case, get() will return `nil` + `err`
+        return nil, err
     end
 
     return user -- table or nil
 end
 
-local db      = my_db_connection -- lua-resty-mysql instance
 local user_id = 3
+local db = my_db_connection -- lua-resty-mysql instance
 
 local user, err = cache:get("users:" .. user_id, { ttl = 3600 }, fetch_user, db, user_id)
 if err then
@@ -372,10 +444,55 @@ else
 end
 ```
 
+This second example is the modification of the above one, in which we apply
+some transformation to the retrieved `user` record, and cache it via the
+`l1_serializer` callback:
+
+```lua
+-- Our l1_serializer, called upon an L1 miss, when L2 or L3 return a hit.
+--
+-- Its signature accepts a single argument: the item as returned from
+-- an L2 hit. Therefore, this argument can never be `nil`. The result will be
+-- kept in the L1 LRU cache, but it cannot be `nil`.
+--
+-- This function can return `nil` and a string describing an error, which
+-- will be bubbled up to the `get()` call. It also runs in protected mode
+-- and will report any Lua error thrown.
+local function compile_custom_code(user_row)
+    if user_row.custom_code ~= nil then
+        local compiled, err = loadstring(user_row.custom_code)
+        if not compiled then
+            -- in this case, nothing will be stored in the cache (as if the L3
+            -- callback failed). This means that if the same operation is
+            -- attempted and the same data is returned, it will fail again.
+            -- Depending on the situation it might not be desireable, and
+            -- storing a default value in the L1 would be a better option.
+            return nil, "failed to compile custom code: " .. err
+        end
+
+        user_row.custom_code = compiled
+    end
+
+    return user_row
+end
+
+local user, err = cache:get("users:" .. user_id,
+                            { l1_serializer = compile_custom_code },
+                            fetch_user, db, user_id)
+if err then
+     ngx.log(ngx.ERR, "could not retrieve user: ", err)
+     return
+end
+
+-- now we have a ready-to-call function which was only
+-- compiled once
+user.custom_code()
+```
+
 [Back to TOC](#table-of-contents)
 
 peek
------
+----
 **syntax:** `ttl, err, value = cache:peek(key)`
 
 Peeks into the L2 (`lua_shared_dict`) cache.
@@ -398,7 +515,7 @@ too volatile (as its size unit is in a number of slots), and the L2 cache is
 still several orders of magnitude faster than the L3 callback.
 
 As its only intent is to take a "peek" into the cache to determine its warmth
-for a given value, `peel()` does not count as a query like [get()](#get), and
+for a given value, `peek()` does not count as a query like [get()](#get), and
 does not set the value in the L1 cache.
 
 Example:
@@ -452,7 +569,9 @@ one of [get()](#get).
 
 The third argument `value` is the value to cache, similar to the return value
 of the L3 callback. Just like the callback's return value, it must be a Lua
-scalar, a table, or `nil`.
+scalar, a table, or `nil`. If a `l1_serializer` is provided either from the
+constructor or in the `opts` argument, it will be called with `value` if
+`value` is not `nil`.
 
 On failure, this method returns `nil` and a string describing the error.
 
@@ -461,11 +580,12 @@ On success, the first return value will be `true`.
 **Note:** methods such as [set()](#set) and [delete()](#delete) require that
 other instances of mlcache (from other workers) evict the value from their
 L1 (LRU) cache. Since OpenResty has currently no built-in mechanism for
-inter-worker communication, this module relies on a polling mechanism via
-a `lua_shared_dict` shared memory zone to propagate inter-worker events. If
-`set()` or `delete()` are called from a single worker, other workers must call
-[update()](#update) before their cache is requested, to make sure they evicted
-their L1 value, and that the L2 (fresh value) will be returned.
+inter-worker communication, this module relies on a polling mechanism via a
+`lua_shared_dict` shared memory zone to propagate inter-worker events. If
+`set()` or `delete()` are called from a single worker, other workers' mlcache
+instances bearing the same `name` must call [update()](#update) before their
+cache be requested during the next request, to make sure they evicted their L1
+value, and that the L2 (fresh value) will be returned.
 
 **Note bis:** It is generally considered inefficient to call `set()` on a hot
 code path (such as in a request being served by OpenResty). Instead, one should
@@ -499,9 +619,45 @@ other instances of mlcache (from other workers) evict the value from their
 L1 (LRU) cache. Since OpenResty has currently no built-in mechanism for
 inter-worker communication, this module relies on a polling mechanism via
 a `lua_shared_dict` shared memory zone to propagate inter-worker events. If
-`set()` or `delete()` are called from a single worker, other workers must call
-[update()](#update) before their cache is requested, to make sure they evicted
-their L1 value, and that the L2 (fresh value) will be returned.
+`set()` or `delete()` are called from a single worker, other workers' mlcache
+instances bearing the same `name` must call [update()](#update) before their
+cache be requested during the next request, to make sure they evicted their L1
+value, and that the L2 (fresh value) will be returned.
+
+**See:** [update()](#update)
+
+[Back to TOC](#table-of-contents)
+
+purge
+-----
+**syntax:** `ok, err = cache:purge(flush_expired?)`
+
+Purge the content of the cache, in both the L1 and L2 levels. Then publishes
+an event to other workers so they can purge their L1 cache as well.
+
+This method recycles the lua-resty-lrucache instance, and calls
+[ngx.shared.DICT:flush_all](https://github.com/openresty/lua-nginx-module#ngxshareddictflush_all)
+, so it can be rather expensive.
+
+The first and only argument `flush_expired` is optional, but if given `true`,
+this method will also call
+[ngx.shared.DICT:flush_expired](https://github.com/openresty/lua-nginx-module#ngxshareddictflush_expired)
+(with no arguments). This is useful to release memory claimed by the L2 (shm)
+cache if needed.
+
+On failure, this method returns `nil` and a string describing the error.
+
+On success, the first return value will be `true`.
+
+**Note:** this method, just like [delete()](#delete), requires that
+other instances of mlcache (from other workers) purge their L1 (LRU) cache.
+Since OpenResty has currently no built-in mechanism for inter-worker
+communication, this module relies on a polling mechanism via a
+`lua_shared_dict` shared memory zone to propagate inter-worker events. If
+this method is called from a single worker, other workers' mlcache instances
+bearing the same `name` must call [update()](#update) before their cache be
+requested during the next request, to make sure they purged their L1 cache as
+well.
 
 **See:** [update()](#update)
 
@@ -511,16 +667,15 @@ update
 ------
 **syntax:** `ok, err = cache:update()`
 
-Poll and execute pending cache invalidation events published to `ipc_shm` by
-other workers.
+Poll and execute pending cache invalidation events published by other workers.
 
 Methods such as [set()](#set) and [delete()](#delete) require that other
-instances of mlcache (from other workers) evict the value from their L1 (LRU)
-cache. Since OpenResty has currently no built-in mechanism for inter-worker
-communication, this module relies on a polling mechanism via the `ipc_shm`
-shared memory zone to propagate inter-worker events. The `lua_shared_dict`
-specified in `ipc_shm` **must not** be used by other actors than mlcache
-itself.
+instances of mlcache (from other workers) evict the value from their L1 cache.
+Since OpenResty has currently no built-in mechanism for inter-worker
+communication, this module bundles an "off the shelf" IPC library to propagate
+inter-worker events. If the bundled IPC library is used, the `lua_shared_dict`
+specified in the `ipc_shm` option **must not** be used by other actors than
+mlcache itself.
 
 This method allows a worker to update its L1 cache (by purging values
 considered stale due to an other worker calling `set()` or `delete()`) before
@@ -531,7 +686,7 @@ processing. This allows your hot code paths to perform a single shm access in
 the best case scenario: no invalidation events were received, all `get()`
 calls will hit in the L1 (LRU) cache. Only on a worst case scenario (`n` values
 were evicted by another worker) will `get()` access the L2 or L3 cache `n`
-times.  Subsequent requests will then hit the best case scenario again, because
+times. Subsequent requests will then hit the best case scenario again, because
 `get()` populated the L1 cache.
 
 For example, if your workers make use of [set()](#set) or [delete()](#delete)
@@ -544,13 +699,13 @@ http {
 
     location / {
         content_by_lua_block {
-            local cache = ... -- retrieve mlcache instance or use your own module
+            local cache = ... -- retrieve mlcache instance
 
             -- make sure L1 cache is evicted of stale values
             -- before calling get()
             local ok, err = cache:update()
             if not ok then
-                ngx.log(ngx.ERR, "failed to poll eviciton events: ", err)
+                ngx.log(ngx.ERR, "failed to poll eviction events: ", err)
                 -- /!\ we might get stale data from get()
             end
 
@@ -567,15 +722,15 @@ http {
             end
 
             -- value and other_value are up-to-date because:
-            -- either they were not considered stable and came from L1 (best case scenario)
+            -- either they were not stale and directly came from L1 (best case scenario)
             -- either they were stale and evicted from L1, and came from L2
-            -- either they were not in L1 nor L2, and came from L3 (worst case scneario)
+            -- either they were not in L1 nor L2, and came from L3 (worst case scenario)
         }
     }
 
     location /delete {
         content_by_lua_block {
-            local cache = ... -- retrieve mlcache instance or use your own module
+            local cache = ... -- retrieve mlcache instance
 
             -- delete some value
             local ok, err = cache:delete("key_1")
@@ -590,7 +745,7 @@ http {
 
     location /set {
         content_by_lua_block {
-            local cache = ... -- retrieve mlcache instance or use your own module
+            local cache = ... -- retrieve mlcache instance
 
             -- update some value
             local ok, err = cache:set("key_1", nil, 123)
@@ -611,9 +766,16 @@ expire naturally from the L1/L2 caches according to their TTL.
 
 **Note bis:** this library was built with the intent to use a better solution
 for inter-worker communication as soon as one emerges. In future versions of
-this library, if an IPC module can avoid the polling approach, so will this
+this library, if an IPC library can avoid the polling approach, so will this
 library. `update()` is only a necessary evil due to today's Nginx/OpenResty
-"limitations".
+"limitations". You can however use your own IPC library by use of the
+`opts.ipc` option when instantiating your mlcache.
+
+[Back to TOC](#table-of-contents)
+
+# Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 [Back to TOC](#table-of-contents)
 
