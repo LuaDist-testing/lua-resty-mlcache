@@ -1,6 +1,5 @@
 -- vim: st=4 sts=4 sw=4 et:
 
-local ffi        = require "ffi"
 local cjson      = require "cjson.safe"
 local lrucache   = require "resty.lrucache"
 local resty_lock = require "resty.lock"
@@ -21,31 +20,10 @@ local ngx_log      = ngx.log
 local WARN         = ngx.WARN
 
 
-local LOCK_KEY_PREFIX         = "lua-resty-mlcache:lock:"
 local CACHE_MISS_SENTINEL_LRU = {}
-local LRU_INSTANCES           = {}
-local SHM_SET_DEFAULT_TRIES   = 3
-
-
-local c_str_type    = ffi.typeof("char *")
-local c_lru_gc_type = ffi.metatype([[
-    struct {
-        char *lru_name;
-        int   len;
-    }
-]], {
-    __gc = function(c_gc_type)
-        local lru_name = ffi.string(c_gc_type.lru_name, c_gc_type.len)
-
-        local lru_gc = LRU_INSTANCES[lru_name]
-        if lru_gc then
-            lru_gc.count = lru_gc.count - 1
-            if lru_gc.count <= 0 then
-                LRU_INSTANCES[lru_name] = nil
-            end
-        end
-    end
-})
+local SHM_SET_DEFAULT_TRIES = 3
+local LOCK_KEY_PREFIX = "lua-resty-mlcache:lock:"
+local LRU_INSTANCES = setmetatable({}, { __mode = "v" })
 
 
 local TYPES_LOOKUP = {
@@ -141,38 +119,20 @@ local function rebuild_lru(self)
     end
 
     -- Several mlcache instances can have the same name and hence, the same
-    -- lru instance. We need to GC such LRU instances when all mlcache
-    -- instances using them are GC'ed.
-    -- We do this by using a C struct with a __gc metamethod.
-
-    local c_lru_gc    = ffi.new(c_lru_gc_type)
-    c_lru_gc.len      = #name
-    c_lru_gc.lru_name = ffi.cast(c_str_type, name)
-
-    -- keep track of our LRU instance and a counter of how many mlcache
-    -- instances are refering to it
-
-    local lru_gc = LRU_INSTANCES[name]
-    if not lru_gc then
-        lru_gc              = { count = 0, lru = nil }
-        LRU_INSTANCES[name] = lru_gc
-    end
-
-    local lru = lru_gc.lru
+    -- lru instance. We need to GC such LRU instance when all mlcache instances
+    -- using them are GC'ed. We do this with a weak table.
+    local lru = LRU_INSTANCES[name]
     if not lru then
-        lru        = lrucache.new(self.lru_size)
-        lru_gc.lru = lru
+        lru = lrucache.new(self.lru_size)
+        LRU_INSTANCES[name] = lru
     end
 
-    self.lru      = lru
-    self.c_lru_gc = c_lru_gc
-
-    lru_gc.count = lru_gc.count + 1
+    self.lru = lru
 end
 
 
 local _M     = {
-    _VERSION = "2.0.1",
+    _VERSION = "2.0.2",
     _AUTHOR  = "Thibault Charbonnier",
     _LICENSE = "MIT",
     _URL     = "https://github.com/thibaultcha/lua-resty-mlcache",
@@ -607,7 +567,7 @@ end
 
 local function unlock_and_ret(lock, res, err, hit_lvl)
     local ok, lerr = lock:unlock()
-    if not ok then
+    if not ok and lerr ~= "unlocked" then
         return nil, "could not unlock callback: " .. lerr
     end
 
@@ -668,9 +628,9 @@ function _M:get(key, opts, cb, ...)
         return nil, "could not create lock: " .. err
     end
 
-    local elapsed, err = lock:lock(LOCK_KEY_PREFIX .. namespaced_key)
-    if not elapsed then
-        return nil, "could not aquire callback lock: " .. err
+    local elapsed, lerr = lock:lock(LOCK_KEY_PREFIX .. namespaced_key)
+    if not elapsed and lerr ~= "timeout" then
+        return nil, "could not acquire callback lock: " .. lerr
     end
 
     -- check for another worker's success at running the callback
@@ -680,15 +640,24 @@ function _M:get(key, opts, cb, ...)
         return unlock_and_ret(lock, nil, err)
     end
 
-    if data then
-        if data == CACHE_MISS_SENTINEL_LRU then
-            return unlock_and_ret(lock, nil, nil, 2)
-        end
+    if data == CACHE_MISS_SENTINEL_LRU then
+        return unlock_and_ret(lock, nil, nil, 2)
+    end
 
+    if data ~= nil then
         return unlock_and_ret(lock, data, nil, 2)
     end
 
-    -- still not in shm, we are responsible for running the callback
+    -- data is nil, we are either the 1st worker to hold the lock, or
+    -- a subsequent worker whose lock has timed out before the 1st one
+    -- finished to run the callback
+
+    if lerr == "timeout" then
+        return nil, "could not acquire callback lock: timeout"
+    end
+
+    -- still not in shm, we are the 1st worker to hold the lock, and thus
+    -- responsible for running the callback
 
     local pok, perr, err, new_ttl = pcall(cb, ...)
     if not pok then
