@@ -1,13 +1,26 @@
 # Table of Contents
 
 - [Unreleased](#unreleased)
+- [2.0.1](#2.0.1)
 - [2.0.0](#2.0.0)
 - [1.0.1](#1.0.1)
 - [1.0.0](#1.0.0)
 
 ## Unreleased
 
-Diff: [2.0.0...master]
+Diff: [2.0.1...master]
+
+[Back to TOC](#table-of-contents)
+
+## [2.0.1]
+
+> Released on: 2018/03/27
+
+#### Fixed
+
+- Ensure the `set()`, `delete()`, `peek()`, and `purge()` method properly
+  support the new `shm_miss` option.
+  [#45](https://github.com/thibaultcha/lua-resty-mlcache/pull/45)
 
 [Back to TOC](#table-of-contents)
 
@@ -22,7 +35,7 @@ values (documented below) do not break any dependent application.
 #### Added
 
 - Implement a new `purge()` method to clear all cached items in both
-  the L2 and L3 caches.
+  the L1 and L2 caches.
   [#34](https://github.com/thibaultcha/lua-resty-mlcache/pull/34)
 - Implement a new `shm_miss` option. This option receives the name
   of a lua_shared_dict, and when specified, will cache misses there instead of
@@ -36,7 +49,7 @@ values (documented below) do not break any dependent application.
   Thanks to [@jdesgats](https://github.com/jdesgats) for the contribution.
   [#29](https://github.com/thibaultcha/lua-resty-mlcache/pull/29)
 - Implement a new `shm_set_tries` option to retry `shm:set()`
-  operations and ensure LRU eviction when caching unusually large values.
+  operations and ensure LRU eviction when caching values of disparate sizes.
   [#41](https://github.com/thibaultcha/lua-resty-mlcache/issues/41)
 - The L3 callback can now return `nil + err`, which will be bubbled up
   to the caller of `get()`. Prior to this change, the second return value of
@@ -45,6 +58,15 @@ values (documented below) do not break any dependent application.
   [#35](https://github.com/thibaultcha/lua-resty-mlcache/pull/35)
 - Support for custom IPC module.
   [#31](https://github.com/thibaultcha/lua-resty-mlcache/issues/31)
+
+#### Fixed
+
+- In the event of a `no memory` error returned by the L2 lua_shared_dict cache
+  (after the number of `shm_set_tries` failed), we do not interrupt the `get()`
+  flow to return an error anymore. Instead, the retrieved value is now bubbled
+  up for insertion in L1, and returned to the caller. A warning log is (by
+  default) printed in the nginx error logs.
+  [#41](https://github.com/thibaultcha/lua-resty-mlcache/issues/41)
 
 [Back to TOC](#table-of-contents)
 
@@ -69,7 +91,8 @@ Initial release.
 
 [Back to TOC](#table-of-contents)
 
-[2.0.0...master]: https://github.com/thibaultcha/lua-resty-mlcache/compare/2.0.0...master
+[2.0.1...master]: https://github.com/thibaultcha/lua-resty-mlcache/compare/2.0.1...master
+[2.0.1]: https://github.com/thibaultcha/lua-resty-mlcache/compare/2.0.0...2.0.1
 [2.0.0]: https://github.com/thibaultcha/lua-resty-mlcache/compare/1.0.1...2.0.0
 [1.0.1]: https://github.com/thibaultcha/lua-resty-mlcache/compare/1.0.0...1.0.1
 [1.0.0]: https://github.com/thibaultcha/lua-resty-mlcache/tree/1.0.0

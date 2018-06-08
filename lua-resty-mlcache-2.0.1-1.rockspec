@@ -1,16 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "lua-resty-mlcache"
-version = "2.0.0-1"
+version = "2.0.1-1"
 -- LuaDist source
 source = {
-  tag = "2.0.0-1",
+  tag = "2.0.1-1",
   url = "git://github.com/LuaDist-testing/lua-resty-mlcache.git"
 }
 -- Original source
 -- source = {
 --   url = "git://github.com/thibaultcha/lua-resty-mlcache",
---   tag = "2.0.0"
+--   tag = "2.0.1"
 -- }
 description = {
   summary  = "Multi-level caching library for OpenResty",
